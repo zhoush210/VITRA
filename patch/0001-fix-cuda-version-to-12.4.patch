@@ -1,0 +1,758 @@
+From 82604e91de3698fd1ecb83b571c879c91d85bf4a Mon Sep 17 00:00:00 2001
+From: zhoush <zhoushihui210@foxmail.com>
+Date: Fri, 12 Dec 2025 09:47:46 +0800
+Subject: [PATCH] fix cuda version to 12.4
+
+---
+ .gitignore                                    |   1 +
+ demo.py                                       |  18 +-
+ infiller/lib/misc/sampler.py                  |   2 +-
+ lib/models/hawor.py                           |   4 +-
+ lib/vis/run_vis2.py                           |   7 +-
+ pytorch3d_install.log                         | 330 ++++++++++++++++++
+ requirements.txt                              |   3 -
+ scripts/scripts_test_video/hawor_video.py     |   9 +-
+ .../DROID-SLAM/droid_slam/depth_video.py      |  31 +-
+ thirdparty/DROID-SLAM/droid_slam/droid.py     |   2 +-
+ .../DROID-SLAM/droid_slam/factor_graph.py     |  10 +
+ thirdparty/DROID-SLAM/src/altcorr_kernel.cu   |   2 +-
+ .../DROID-SLAM/src/correlation_kernels.cu     |   4 +-
+ thirdparty/DROID-SLAM/thirdparty/lietorch     |   2 +-
+ thirdparty/Metric3D/demo.py                   |   4 +-
+ .../Metric3D/mono/model/backbones/ViT_DINO.py |   4 +-
+ .../mono/model/backbones/ViT_DINO_reg.py      |   4 +-
+ .../training/mono/model/backbones/ViT_DINO.py |   4 +-
+ .../mono/model/backbones/ViT_DINO_reg.py      |   4 +-
+ 19 files changed, 416 insertions(+), 29 deletions(-)
+ create mode 100644 pytorch3d_install.log
+
+diff --git a/.gitignore b/.gitignore
+index b98c886..33e01dd 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -72,3 +72,4 @@ ipython_config.py
+ 
+ vis.mp4
+ imgui.ini
++example/*
+diff --git a/demo.py b/demo.py
+index bf3382f..68237c2 100644
+--- a/demo.py
++++ b/demo.py
+@@ -2,6 +2,19 @@ import argparse
+ import sys
+ import os
+ 
++# Monkey patch moderngl to use EGL instead of X11
++import moderngl
++_original_create_standalone = moderngl.create_standalone_context
++def _patched_create_standalone(*args, **kwargs):
++    # Remove standalone-specific arguments that don't work with EGL
++    kwargs.pop('standalone', None)
++    # Create EGL context without mode parameter
++    require = kwargs.get('require', 330)
++    size = kwargs.get('size', (256, 256))
++    return moderngl.create_context(require=require, standalone=True, backend='egl')
++
++moderngl.create_standalone_context = _patched_create_standalone
++
+ import torch
+ sys.path.insert(0, os.path.dirname(__file__))
+ import numpy as np
+@@ -22,6 +35,7 @@ if __name__ == '__main__':
+     parser.add_argument("--checkpoint",  type=str, default='./weights/hawor/checkpoints/hawor.ckpt')
+     parser.add_argument("--infiller_weight",  type=str, default='./weights/hawor/checkpoints/infiller.pt')
+     parser.add_argument("--vis_mode",  type=str, default='world', help='cam | world')
++    parser.add_argument("--no_display", action='store_true', help='Do not display visualization, only save to video')
+     args = parser.parse_args()
+ 
+     start_idx, end_idx, seq_folder, imgfiles = detect_track_video(args)
+@@ -100,14 +114,14 @@ if __name__ == '__main__':
+             os.makedirs(output_pth)
+         image_names = imgfiles[vis_start:vis_end]
+         print(f"vis {vis_start} to {vis_end}")
+-        run_vis2_on_video(left_dict, right_dict, output_pth, img_focal, image_names, R_c2w=R_c2w_sla_all[vis_start:vis_end], t_c2w=t_c2w_sla_all[vis_start:vis_end])
++        run_vis2_on_video(left_dict, right_dict, output_pth, img_focal, image_names, R_c2w=R_c2w_sla_all[vis_start:vis_end], t_c2w=t_c2w_sla_all[vis_start:vis_end], interactive=not args.no_display)
+     elif args.vis_mode == 'cam':
+         output_pth = os.path.join(seq_folder, f"vis_{vis_start}_{vis_end}")
+         if not os.path.exists(output_pth):
+             os.makedirs(output_pth)
+         image_names = imgfiles[vis_start:vis_end]
+         print(f"vis {vis_start} to {vis_end}")
+-        run_vis2_on_video_cam(left_dict, right_dict, output_pth, img_focal, image_names, R_w2c=R_w2c_sla_all[vis_start:vis_end], t_w2c=t_w2c_sla_all[vis_start:vis_end])
++        run_vis2_on_video_cam(left_dict, right_dict, output_pth, img_focal, image_names, R_w2c=R_w2c_sla_all[vis_start:vis_end], t_w2c=t_w2c_sla_all[vis_start:vis_end], interactive=not args.no_display)
+ 
+     print("finish")
+ 
+diff --git a/infiller/lib/misc/sampler.py b/infiller/lib/misc/sampler.py
+index 16d44f6..a51de78 100644
+--- a/infiller/lib/misc/sampler.py
++++ b/infiller/lib/misc/sampler.py
+@@ -27,7 +27,7 @@ def test(opt, device):
+     weights = os.listdir(wdir)
+     weights_paths = [wdir / weight for weight in weights]
+     latest_weight = max(weights_paths , key = os.path.getctime)
+-    ckpt = torch.load(latest_weight, map_location=device)
++    ckpt = torch.load(latest_weight, map_location=device, weights_only=False)
+     print(f"Loaded weight: {latest_weight}")
+ 
+     # Load Skeleton
+diff --git a/lib/models/hawor.py b/lib/models/hawor.py
+index 34a081c..63b9e6e 100644
+--- a/lib/models/hawor.py
++++ b/lib/models/hawor.py
+@@ -48,7 +48,7 @@ class HAWOR(pl.LightningModule):
+         self.backbone = create_backbone(cfg)
+         try:
+             if cfg.MODEL.BACKBONE.get('PRETRAINED_WEIGHTS', None):
+-                whole_state_dict = torch.load(cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS, map_location='cpu')['state_dict']
++                whole_state_dict = torch.load(cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS, map_location='cpu', weights_only=False)['state_dict']
+                 backbone_state_dict = {}
+                 for key in whole_state_dict:
+                     if key[:9] == 'backbone.':
+@@ -116,7 +116,7 @@ class HAWOR(pl.LightningModule):
+         self.automatic_optimization = False
+ 
+         if cfg.MODEL.get('LOAD_WEIGHTS', None):
+-            whole_state_dict = torch.load(cfg.MODEL.LOAD_WEIGHTS, map_location='cpu')['state_dict']
++            whole_state_dict = torch.load(cfg.MODEL.LOAD_WEIGHTS, map_location='cpu', weights_only=False)['state_dict']
+             self.load_state_dict(whole_state_dict, strict=True)
+             print(f"load {cfg.MODEL.LOAD_WEIGHTS}")
+ 
+diff --git a/lib/vis/run_vis2.py b/lib/vis/run_vis2.py
+index fc3893d..cbe3177 100644
+--- a/lib/vis/run_vis2.py
++++ b/lib/vis/run_vis2.py
+@@ -142,7 +142,7 @@ def run_vis2_on_video(res_dict, res_dict2, output_pth, focal_length, image_names
+         viewer.render_seq(batch, out_folder=os.path.join(output_pth, 'aitviewer'))
+         return os.path.join(output_pth, 'aitviewer', "video_0.mp4")
+ 
+-def run_vis2_on_video_cam(res_dict, res_dict2, output_pth, focal_length, image_names, R_w2c=None, t_w2c=None):
++def run_vis2_on_video_cam(res_dict, res_dict2, output_pth, focal_length, image_names, R_w2c=None, t_w2c=None, interactive=True):
+     
+     img0 = cv2.imread(image_names[0])
+     height, width, _ = img0.shape
+@@ -210,7 +210,10 @@ def run_vis2_on_video_cam(res_dict, res_dict2, output_pth, focal_length, image_n
+     data = viewer_utils.ViewerData(Rt, K, cols, rows, imgnames=image_names)
+     batch = (meshes, data)
+ 
+-    viewer = viewer_utils.ARCTICViewer(interactive=True, size=(vis_w, vis_h))
++    if interactive:
++        viewer = viewer_utils.ARCTICViewer(interactive=True, size=(vis_w, vis_h))
++    else:
++        viewer = viewer_utils.ARCTICViewer(interactive=False, size=(vis_w, vis_h), render_types=['video'])
+     viewer.render_seq(batch, out_folder=os.path.join(output_pth, 'aitviewer'))
+ 
+ def lookat_matrix(source_pos, target_pos, up):
+diff --git a/pytorch3d_install.log b/pytorch3d_install.log
+new file mode 100644
+index 0000000..218876f
+--- /dev/null
++++ b/pytorch3d_install.log
+@@ -0,0 +1,330 @@
++Collecting git+https://github.com/facebookresearch/pytorch3d.git@stable
++  Cloning https://github.com/facebookresearch/pytorch3d.git (to revision stable) to /tmp/pip-req-build-xqxzk1b0
++  Running command git clone --filter=blob:none --quiet https://github.com/facebookresearch/pytorch3d.git /tmp/pip-req-build-xqxzk1b0
++  Running command git checkout -q 75ebeeaea0908c5527e7b1e305fbc7681382db47
++  Resolved https://github.com/facebookresearch/pytorch3d.git to commit 75ebeeaea0908c5527e7b1e305fbc7681382db47
++  Preparing metadata (pyproject.toml): started
++  Preparing metadata (pyproject.toml): finished with status 'done'
++Requirement already satisfied: iopath in /home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages (from pytorch3d==0.7.8) (0.1.10)
++Requirement already satisfied: tqdm in /home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages (from iopath->pytorch3d==0.7.8) (4.67.1)
++Requirement already satisfied: typing_extensions in /home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages (from iopath->pytorch3d==0.7.8) (4.15.0)
++Requirement already satisfied: portalocker in /home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages (from iopath->pytorch3d==0.7.8) (3.2.0)
++Building wheels for collected packages: pytorch3d
++  Building wheel for pytorch3d (pyproject.toml): started
++  Building wheel for pytorch3d (pyproject.toml): finished with status 'error'
++  error: subprocess-exited-with-error
++  
++  × Building wheel for pytorch3d (pyproject.toml) did not run successfully.
++  │ exit code: 1
++  ╰─> [302 lines of output]
++      /home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/torch/utils/cpp_extension.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
++        from pkg_resources import packaging  # type: ignore[attr-defined]
++      <string>:84: UserWarning: The environment variable `CUB_HOME` was not found. NVIDIA CUB is required for compilation and can be downloaded from `https://github.com/NVIDIA/cub/releases`. You can unpack it to a location of your choice and set the environment variable `CUB_HOME` to the folder containing the `CMakeListst.txt` file.
++      running bdist_wheel
++      /home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/torch/utils/cpp_extension.py:476: UserWarning: Attempted to use ninja as the BuildExtension backend but we could not find ninja.. Falling back to using the slow distutils backend.
++        warnings.warn(msg.format('we could not find ninja.'))
++      running build
++      running build_py
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d
++      copying pytorch3d/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d
++      creating build/lib.linux-x86_64-cpython-310/projects
++      copying projects/__init__.py -> build/lib.linux-x86_64-cpython-310/projects
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/transforms
++      copying pytorch3d/transforms/math.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/transforms
++      copying pytorch3d/transforms/transform3d.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/transforms
++      copying pytorch3d/transforms/so3.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/transforms
++      copying pytorch3d/transforms/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/transforms
++      copying pytorch3d/transforms/se3.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/transforms
++      copying pytorch3d/transforms/rotation_conversions.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/transforms
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/vis
++      copying pytorch3d/vis/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/vis
++      copying pytorch3d/vis/plotly_vis.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/vis
++      copying pytorch3d/vis/texture_vis.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/vis
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/renderer
++      copying pytorch3d/renderer/camera_utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer
++      copying pytorch3d/renderer/lighting.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer
++      copying pytorch3d/renderer/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer
++      copying pytorch3d/renderer/cameras.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer
++      copying pytorch3d/renderer/fisheyecameras.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer
++      copying pytorch3d/renderer/materials.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer
++      copying pytorch3d/renderer/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer
++      copying pytorch3d/renderer/compositing.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer
++      copying pytorch3d/renderer/blending.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer
++      copying pytorch3d/renderer/splatter_blend.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer
++      copying pytorch3d/renderer/camera_conversions.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/datasets
++      copying pytorch3d/datasets/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/datasets
++      copying pytorch3d/datasets/shapenet_base.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/datasets
++      copying pytorch3d/datasets/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/datasets
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/io
++      copying pytorch3d/io/ply_io.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/io
++      copying pytorch3d/io/experimental_gltf_io.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/io
++      copying pytorch3d/io/pluggable.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/io
++      copying pytorch3d/io/mtl_io.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/io
++      copying pytorch3d/io/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/io
++      copying pytorch3d/io/off_io.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/io
++      copying pytorch3d/io/pluggable_formats.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/io
++      copying pytorch3d/io/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/io
++      copying pytorch3d/io/obj_io.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/io
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/loss
++      copying pytorch3d/loss/point_mesh_distance.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/loss
++      copying pytorch3d/loss/mesh_laplacian_smoothing.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/loss
++      copying pytorch3d/loss/chamfer.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/loss
++      copying pytorch3d/loss/mesh_normal_consistency.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/loss
++      copying pytorch3d/loss/mesh_edge_loss.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/loss
++      copying pytorch3d/loss/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/loss
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/structures
++      copying pytorch3d/structures/pointclouds.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/structures
++      copying pytorch3d/structures/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/structures
++      copying pytorch3d/structures/volumes.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/structures
++      copying pytorch3d/structures/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/structures
++      copying pytorch3d/structures/meshes.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/structures
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron
++      copying pytorch3d/implicitron/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron
++      copying pytorch3d/implicitron/eval_demo.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/laplacian_matrices.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/points_to_volumes.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/points_normals.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/perspective_n_points.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/sample_points_from_meshes.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/iou_box3d.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/marching_cubes.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/mesh_filtering.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/packed_to_padded.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/ball_query.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/mesh_face_areas_normals.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/vert_align.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/interp_face_attrs.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/subdivide_meshes.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/knn.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/graph_conv.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/cubify.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/cameras_alignment.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/points_alignment.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/marching_cubes_data.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      copying pytorch3d/ops/sample_farthest_points.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/ops
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/utils
++      copying pytorch3d/utils/torus.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/utils
++      copying pytorch3d/utils/ico_sphere.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/utils
++      copying pytorch3d/utils/checkerboard.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/utils
++      copying pytorch3d/utils/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/utils
++      copying pytorch3d/utils/camera_conversions.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/utils
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/common
++      copying pytorch3d/common/datatypes.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/common
++      copying pytorch3d/common/compat.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/common
++      copying pytorch3d/common/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/common
++      copying pytorch3d/common/linear_with_repeat.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/common
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/implicit
++      copying pytorch3d/renderer/implicit/raymarching.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/implicit
++      copying pytorch3d/renderer/implicit/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/implicit
++      copying pytorch3d/renderer/implicit/sample_pdf.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/implicit
++      copying pytorch3d/renderer/implicit/renderer.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/implicit
++      copying pytorch3d/renderer/implicit/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/implicit
++      copying pytorch3d/renderer/implicit/harmonic_embedding.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/implicit
++      copying pytorch3d/renderer/implicit/raysampling.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/implicit
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/opengl
++      copying pytorch3d/renderer/opengl/rasterizer_opengl.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/opengl
++      copying pytorch3d/renderer/opengl/opengl_utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/opengl
++      copying pytorch3d/renderer/opengl/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/opengl
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/points
++      copying pytorch3d/renderer/points/rasterize_points.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/points
++      copying pytorch3d/renderer/points/rasterizer.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/points
++      copying pytorch3d/renderer/points/compositor.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/points
++      copying pytorch3d/renderer/points/renderer.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/points
++      copying pytorch3d/renderer/points/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/points
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/mesh
++      copying pytorch3d/renderer/mesh/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/mesh
++      copying pytorch3d/renderer/mesh/rasterizer.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/mesh
++      copying pytorch3d/renderer/mesh/shading.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/mesh
++      copying pytorch3d/renderer/mesh/rasterize_meshes.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/mesh
++      copying pytorch3d/renderer/mesh/renderer.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/mesh
++      copying pytorch3d/renderer/mesh/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/mesh
++      copying pytorch3d/renderer/mesh/shader.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/mesh
++      copying pytorch3d/renderer/mesh/clip.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/mesh
++      copying pytorch3d/renderer/mesh/textures.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/mesh
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/points/pulsar
++      copying pytorch3d/renderer/points/pulsar/unified.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/points/pulsar
++      copying pytorch3d/renderer/points/pulsar/renderer.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/points/pulsar
++      copying pytorch3d/renderer/points/pulsar/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/renderer/points/pulsar
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/datasets/r2n2
++      copying pytorch3d/datasets/r2n2/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/datasets/r2n2
++      copying pytorch3d/datasets/r2n2/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/datasets/r2n2
++      copying pytorch3d/datasets/r2n2/r2n2.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/datasets/r2n2
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/datasets/shapenet
++      copying pytorch3d/datasets/shapenet/shapenet_core.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/datasets/shapenet
++      copying pytorch3d/datasets/shapenet/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/datasets/shapenet
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/third_party
++      copying pytorch3d/implicitron/third_party/hyperlayers.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/third_party
++      copying pytorch3d/implicitron/third_party/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/third_party
++      copying pytorch3d/implicitron/third_party/pytorch_prototyping.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/third_party
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/camera_utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/stats.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/image_utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/model_io.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/rasterize_mc.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/point_cloud_utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/eval_video_trajectory.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/config.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/depth_cleanup.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/circle_fitting.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/video_writer.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/metric_utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      copying pytorch3d/implicitron/tools/vis_utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/tools
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/evaluation
++      copying pytorch3d/implicitron/evaluation/evaluator.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/evaluation
++      copying pytorch3d/implicitron/evaluation/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/evaluation
++      copying pytorch3d/implicitron/evaluation/evaluate_new_view_synthesis.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/evaluation
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/dataset_map_provider.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/types.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/rendered_mesh_dataset_map_provider.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/frame_data.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/sql_dataset_provider.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/json_index_dataset_map_provider.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/llff_dataset_map_provider.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/single_sequence_dataset.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/data_source.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/dataset_base.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/json_index_dataset_map_provider_v2.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/data_loader_map_provider.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/load_blender.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/load_llff.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/orm_types.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/json_index_dataset.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/blender_dataset_map_provider.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/sql_dataset.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/scene_batch_sampler.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/train_eval_data_loader_provider.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      copying pytorch3d/implicitron/dataset/visualize.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/dataset
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models
++      copying pytorch3d/implicitron/models/model_dbir.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models
++      copying pytorch3d/implicitron/models/overfit_model.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models
++      copying pytorch3d/implicitron/models/metrics.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models
++      copying pytorch3d/implicitron/models/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models
++      copying pytorch3d/implicitron/models/generic_model.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models
++      copying pytorch3d/implicitron/models/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models
++      copying pytorch3d/implicitron/models/base_model.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/implicit_function
++      copying pytorch3d/implicitron/models/implicit_function/voxel_grid.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/implicit_function
++      copying pytorch3d/implicitron/models/implicit_function/neural_radiance_field.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/implicit_function
++      copying pytorch3d/implicitron/models/implicit_function/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/implicit_function
++      copying pytorch3d/implicitron/models/implicit_function/decoding_functions.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/implicit_function
++      copying pytorch3d/implicitron/models/implicit_function/base.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/implicit_function
++      copying pytorch3d/implicitron/models/implicit_function/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/implicit_function
++      copying pytorch3d/implicitron/models/implicit_function/scene_representation_networks.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/implicit_function
++      copying pytorch3d/implicitron/models/implicit_function/voxel_grid_implicit_function.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/implicit_function
++      copying pytorch3d/implicitron/models/implicit_function/idr_feature_field.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/implicit_function
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/renderer
++      copying pytorch3d/implicitron/models/renderer/ray_tracing.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/renderer
++      copying pytorch3d/implicitron/models/renderer/rgb_net.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/renderer
++      copying pytorch3d/implicitron/models/renderer/raymarcher.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/renderer
++      copying pytorch3d/implicitron/models/renderer/base.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/renderer
++      copying pytorch3d/implicitron/models/renderer/ray_point_refiner.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/renderer
++      copying pytorch3d/implicitron/models/renderer/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/renderer
++      copying pytorch3d/implicitron/models/renderer/lstm_renderer.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/renderer
++      copying pytorch3d/implicitron/models/renderer/ray_sampler.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/renderer
++      copying pytorch3d/implicitron/models/renderer/multipass_ea.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/renderer
++      copying pytorch3d/implicitron/models/renderer/sdf_renderer.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/renderer
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/view_pooler
++      copying pytorch3d/implicitron/models/view_pooler/view_sampler.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/view_pooler
++      copying pytorch3d/implicitron/models/view_pooler/feature_aggregator.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/view_pooler
++      copying pytorch3d/implicitron/models/view_pooler/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/view_pooler
++      copying pytorch3d/implicitron/models/view_pooler/view_pooler.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/view_pooler
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/visualization
++      copying pytorch3d/implicitron/models/visualization/render_flyaround.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/visualization
++      copying pytorch3d/implicitron/models/visualization/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/visualization
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/feature_extractor
++      copying pytorch3d/implicitron/models/feature_extractor/feature_extractor.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/feature_extractor
++      copying pytorch3d/implicitron/models/feature_extractor/resnet_feature_extractor.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/feature_extractor
++      copying pytorch3d/implicitron/models/feature_extractor/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/feature_extractor
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/global_encoder
++      copying pytorch3d/implicitron/models/global_encoder/global_encoder.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/global_encoder
++      copying pytorch3d/implicitron/models/global_encoder/autodecoder.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/global_encoder
++      copying pytorch3d/implicitron/models/global_encoder/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron/models/global_encoder
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/common/workaround
++      copying pytorch3d/common/workaround/symeig3x3.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/common/workaround
++      copying pytorch3d/common/workaround/utils.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/common/workaround
++      copying pytorch3d/common/workaround/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/common/workaround
++      creating build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron_trainer
++      copying projects/implicitron_trainer/__init__.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron_trainer
++      copying projects/implicitron_trainer/experiment.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron_trainer
++      copying projects/implicitron_trainer/visualize_reconstruction.py -> build/lib.linux-x86_64-cpython-310/pytorch3d/implicitron_trainer
++      copying pytorch3d/datasets/r2n2/r2n2_synset_dict.json -> build/lib.linux-x86_64-cpython-310/pytorch3d/datasets/r2n2
++      copying pytorch3d/datasets/shapenet/shapenet_synset_dict_v1.json -> build/lib.linux-x86_64-cpython-310/pytorch3d/datasets/shapenet
++      copying pytorch3d/datasets/shapenet/shapenet_synset_dict_v2.json -> build/lib.linux-x86_64-cpython-310/pytorch3d/datasets/shapenet
++      running build_ext
++      Traceback (most recent call last):
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 389, in <module>
++          main()
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 373, in main
++          json_out["return_val"] = hook(**hook_input["kwargs"])
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 280, in build_wheel
++          return _build_backend().build_wheel(
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/build_meta.py", line 435, in build_wheel
++          return _build(['bdist_wheel', '--dist-info-dir', str(metadata_directory)])
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/build_meta.py", line 423, in _build
++          return self._build_with_temp_dir(
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/build_meta.py", line 404, in _build_with_temp_dir
++          self.run_setup()
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/build_meta.py", line 512, in run_setup
++          super().run_setup(setup_script=setup_script)
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/build_meta.py", line 317, in run_setup
++          exec(code, locals())
++        File "<string>", line 144, in <module>
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/__init__.py", line 115, in setup
++          return distutils.core.setup(**attrs)
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/_distutils/core.py", line 186, in setup
++          return run_commands(dist)
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/_distutils/core.py", line 202, in run_commands
++          dist.run_commands()
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/_distutils/dist.py", line 1002, in run_commands
++          self.run_command(cmd)
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/dist.py", line 1102, in run_command
++          super().run_command(command)
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/_distutils/dist.py", line 1021, in run_command
++          cmd_obj.run()
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/command/bdist_wheel.py", line 370, in run
++          self.run_command("build")
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/_distutils/cmd.py", line 357, in run_command
++          self.distribution.run_command(command)
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/dist.py", line 1102, in run_command
++          super().run_command(command)
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/_distutils/dist.py", line 1021, in run_command
++          cmd_obj.run()
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/_distutils/command/build.py", line 135, in run
++          self.run_command(cmd_name)
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/_distutils/cmd.py", line 357, in run_command
++          self.distribution.run_command(command)
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/dist.py", line 1102, in run_command
++          super().run_command(command)
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/_distutils/dist.py", line 1021, in run_command
++          cmd_obj.run()
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/command/build_ext.py", line 96, in run
++          _build_ext.run(self)
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/setuptools/_distutils/command/build_ext.py", line 368, in run
++          self.build_extensions()
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 499, in build_extensions
++          _check_cuda_version(compiler_name, compiler_version)
++        File "/home/shihuiz/miniconda3/envs/hawor/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 386, in _check_cuda_version
++          raise RuntimeError(CUDA_MISMATCH_MESSAGE.format(cuda_str_version, torch.version.cuda))
++      RuntimeError:
++      The detected CUDA version (12.4) mismatches the version that was used to compile
++      PyTorch (11.7). Please make sure to use the same CUDA versions.
++      
++      [end of output]
++  
++  note: This error originates from a subprocess, and is likely not a problem with pip.
++  ERROR: Failed building wheel for pytorch3d
++Failed to build pytorch3d
++error: failed-wheel-build-for-install
++
++× Failed to build installable wheels for some pyproject.toml based projects
++╰─> pytorch3d
+diff --git a/requirements.txt b/requirements.txt
+index 66530b5..c86d60b 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -21,8 +21,6 @@ supervision
+ pycocotools
+ joblib
+ natsort
+-git+https://github.com/facebookresearch/pytorch3d.git@stable
+-torch-scatter==2.1.2
+ evo
+ pytorch-minimize
+ mmengine==0.10.4
+@@ -33,5 +31,4 @@ easydict
+ loguru
+ dill
+ lapx
+-chumpy@git+https://github.com/mattloper/chumpy
+ moderngl-window==2.4.6
+\ No newline at end of file
+diff --git a/scripts/scripts_test_video/hawor_video.py b/scripts/scripts_test_video/hawor_video.py
+index c7f2995..67198b1 100644
+--- a/scripts/scripts_test_video/hawor_video.py
++++ b/scripts/scripts_test_video/hawor_video.py
+@@ -10,6 +10,13 @@ from tqdm import tqdm
+ from glob import glob
+ from natsort import natsorted
+ 
++# Monkey patch torch.load to use weights_only=False for PyTorch 2.6 compatibility
++_original_torch_load = torch.load
++def _patched_torch_load(*args, **kwargs):
++    kwargs.setdefault('weights_only', False)
++    return _original_torch_load(*args, **kwargs)
++torch.load = _patched_torch_load
++
+ from lib.pipeline.tools import parse_chunks, parse_chunks_hand_frame
+ from lib.models.hawor import HAWOR
+ from lib.eval_utils.custom_utils import cam2world_convert, load_slam_cam
+@@ -223,7 +230,7 @@ def hawor_infiller(args, start_idx, end_idx, frame_chunks_all):
+     # load infiller
+     weight_path = args.infiller_weight
+     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+-    ckpt = torch.load(weight_path, map_location=device)
++    ckpt = torch.load(weight_path, map_location=device, weights_only=False)
+     pos_dim = 3
+     shape_dim = 10
+     num_joints = 15
+diff --git a/thirdparty/DROID-SLAM/droid_slam/depth_video.py b/thirdparty/DROID-SLAM/droid_slam/depth_video.py
+index a23e262..a112696 100644
+--- a/thirdparty/DROID-SLAM/droid_slam/depth_video.py
++++ b/thirdparty/DROID-SLAM/droid_slam/depth_video.py
+@@ -190,8 +190,33 @@ class DepthVideo:
+             # [t0, t1] window of bundle adjustment optimization
+             if t1 is None:
+                 t1 = max(ii.max().item(), jj.max().item()) + 1
+-
+-            droid_backends.ba(self.poses, self.disps, self.intrinsics[0], self.disps_sens,
+-                target, weight, eta, ii, jj, t0, t1, itrs, lm, ep, motion_only)
++            
++            # Check if we have valid edges to optimize
++            if len(ii) == 0 or len(jj) == 0:
++                print(f"Warning: BA called with empty edge indices (ii: {len(ii)}, jj: {len(jj)}). Skipping BA.")
++                return
++
++            # Validate parameters to avoid CUDA kernel configuration errors
++            num_edges = len(ii)
++            if num_edges > 10000:  # Arbitrary large limit
++                print(f"Warning: Too many edges ({num_edges}), may cause CUDA errors. Sampling subset.")
++                indices = torch.randperm(num_edges)[:10000]
++                ii = ii[indices]
++                jj = jj[indices]
++                target = target[indices]
++                weight = weight[indices]
++            
++            # Additional safety check
++            try:
++                droid_backends.ba(self.poses, self.disps, self.intrinsics[0], self.disps_sens,
++                    target, weight, eta, ii, jj, t0, t1, itrs, lm, ep, motion_only)
++            except RuntimeError as e:
++                if "CUDA" in str(e):
++                    print(f"CUDA error in BA: {e}")
++                    print(f"BA params: num_edges={len(ii)}, t0={t0}, t1={t1}, poses.shape={self.poses.shape}, target.shape={target.shape}")
++                    # Try to continue without this BA step
++                    return
++                else:
++                    raise
+ 
+             self.disps.clamp_(min=0.001)
+diff --git a/thirdparty/DROID-SLAM/droid_slam/droid.py b/thirdparty/DROID-SLAM/droid_slam/droid.py
+index 827e13e..e46c140 100644
+--- a/thirdparty/DROID-SLAM/droid_slam/droid.py
++++ b/thirdparty/DROID-SLAM/droid_slam/droid.py
+@@ -49,7 +49,7 @@ class Droid:
+ 
+         self.net = DroidNet()
+         state_dict = OrderedDict([
+-            (k.replace("module.", ""), v) for (k, v) in torch.load(weights).items()])
++            (k.replace("module.", ""), v) for (k, v) in torch.load(weights, weights_only=False).items()])
+ 
+         state_dict["update.weight.2.weight"] = state_dict["update.weight.2.weight"][:2]
+         state_dict["update.weight.2.bias"] = state_dict["update.weight.2.bias"][:2]
+diff --git a/thirdparty/DROID-SLAM/droid_slam/factor_graph.py b/thirdparty/DROID-SLAM/droid_slam/factor_graph.py
+index af7e7c5..a351789 100644
+--- a/thirdparty/DROID-SLAM/droid_slam/factor_graph.py
++++ b/thirdparty/DROID-SLAM/droid_slam/factor_graph.py
+@@ -393,5 +393,15 @@ class FactorGraph:
+                         if (t0 <= i1 < t) and (t1 <= j1 < t):
+                             d[(i1-t0)*(t-t1) + (j1-t1)] = np.inf
+ 
++        # Check if we found any proximity factors
++        if len(es) == 0:
++            print(f"Warning: No proximity factors found for frames {t0}-{t} and {t1}-{t}. Using fallback strategy.")
++            # Create a minimal valid factor to avoid downstream errors
++            if t0 < t and t1 < t:
++                es = np.array([[t0, t1]])
++            else:
++                # If we really can't create any factors, return without doing anything
++                return
++            
+         ii, jj = torch.as_tensor(es, device=self.device).unbind(dim=-1)
+         self.add_factors(ii, jj, remove)
+diff --git a/thirdparty/DROID-SLAM/src/altcorr_kernel.cu b/thirdparty/DROID-SLAM/src/altcorr_kernel.cu
+index f418f5c..b53be29 100644
+--- a/thirdparty/DROID-SLAM/src/altcorr_kernel.cu
++++ b/thirdparty/DROID-SLAM/src/altcorr_kernel.cu
+@@ -306,7 +306,7 @@ std::vector<torch::Tensor> altcorr_cuda_forward(
+   const dim3 threads(BLOCK_H, BLOCK_W);
+ 
+ 
+-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(fmap1.type(), "altcorr_forward_kernel", ([&] {
++  AT_DISPATCH_FLOATING_TYPES_AND_HALF(fmap1.scalar_type(), "altcorr_forward_kernel", ([&] {
+     altcorr_forward_kernel<scalar_t><<<blocks, threads>>>(
+         fmap1.packed_accessor32<scalar_t,4,torch::RestrictPtrTraits>(),
+         fmap2.packed_accessor32<scalar_t,4,torch::RestrictPtrTraits>(),
+diff --git a/thirdparty/DROID-SLAM/src/correlation_kernels.cu b/thirdparty/DROID-SLAM/src/correlation_kernels.cu
+index 2812067..df5735c 100644
+--- a/thirdparty/DROID-SLAM/src/correlation_kernels.cu
++++ b/thirdparty/DROID-SLAM/src/correlation_kernels.cu
+@@ -142,7 +142,7 @@ std::vector<torch::Tensor> corr_index_cuda_forward(
+   torch::Tensor corr = torch::zeros(
+     {batch_size, 2*radius+1, 2*radius+1, ht, wd}, opts);
+ 
+-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(volume.type(), "sampler_forward_kernel", ([&] {
++  AT_DISPATCH_FLOATING_TYPES_AND_HALF(volume.scalar_type(), "sampler_forward_kernel", ([&] {
+     corr_index_forward_kernel<scalar_t><<<blocks, threads>>>(
+       volume.packed_accessor32<scalar_t,5,torch::RestrictPtrTraits>(),
+       coords.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+@@ -173,7 +173,7 @@ std::vector<torch::Tensor> corr_index_cuda_backward(
+   const dim3 threads(BLOCK, BLOCK);
+ 
+ 
+-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(volume.type(), "sampler_backward_kernel", ([&] {
++  AT_DISPATCH_FLOATING_TYPES_AND_HALF(volume.scalar_type(), "sampler_backward_kernel", ([&] {
+     corr_index_backward_kernel<scalar_t><<<blocks, threads>>>(
+       coords.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+       corr_grad.packed_accessor32<scalar_t,5,torch::RestrictPtrTraits>(),
+diff --git a/thirdparty/DROID-SLAM/thirdparty/lietorch b/thirdparty/DROID-SLAM/thirdparty/lietorch
+index 0fa9ce8..d7f1ea1 160000
+--- a/thirdparty/DROID-SLAM/thirdparty/lietorch
++++ b/thirdparty/DROID-SLAM/thirdparty/lietorch
+@@ -1 +1 @@
+-Subproject commit 0fa9ce8ffca86d985eca9e189a99690d6f3d4df6
++Subproject commit d7f1ea1c2395266d9345c71b06d1cbb5e054c4f1
+diff --git a/thirdparty/Metric3D/demo.py b/thirdparty/Metric3D/demo.py
+index af8af44..e90918e 100644
+--- a/thirdparty/Metric3D/demo.py
++++ b/thirdparty/Metric3D/demo.py
+@@ -96,7 +96,7 @@ def metric3d_vit_small(pretrain=False, **kwargs):
+   if pretrain:
+     model.load_state_dict(
+       # torch.hub.load_state_dict_from_url(ckpt_file)['model_state_dict'], 
+-      torch.load('weight/metric_depth_vit_small_800k.pth')['model_state_dict'], 
++      torch.load('weight/metric_depth_vit_small_800k.pth', weights_only=False)['model_state_dict'], 
+       strict=False,
+     )
+   return model
+@@ -119,7 +119,7 @@ def metric3d_vit_large(pretrain=False, **kwargs):
+   if pretrain:
+     model.load_state_dict(
+       # torch.hub.load_state_dict_from_url(ckpt_file)['model_state_dict'], 
+-      torch.load('weight/metric_depth_vit_large_800k.pth')['model_state_dict'], 
++      torch.load('weight/metric_depth_vit_large_800k.pth', weights_only=False)['model_state_dict'], 
+       strict=False,
+     )
+   return model
+diff --git a/thirdparty/Metric3D/mono/model/backbones/ViT_DINO.py b/thirdparty/Metric3D/mono/model/backbones/ViT_DINO.py
+index 6ba2d39..e8d4e63 100644
+--- a/thirdparty/Metric3D/mono/model/backbones/ViT_DINO.py
++++ b/thirdparty/Metric3D/mono/model/backbones/ViT_DINO.py
+@@ -1375,7 +1375,7 @@ def vit_large(patch_size=14, checkpoint=None, **kwargs):
+ 
+     if checkpoint is not None:
+         with open(checkpoint, "rb") as f:
+-            state_dict = torch.load(f)
++            state_dict = torch.load(f, weights_only=False)
+         try:
+             model.load_state_dict(state_dict, strict=True)
+         except:
+@@ -1406,7 +1406,7 @@ def vit_large(patch_size=14, checkpoint=None, **kwargs):
+     
+     # if checkpoint is not None:
+     #     with open(checkpoint, "rb") as f:
+-    #         state_dict = torch.load(f)
++    #         state_dict = torch.load(f, weights_only=False)
+     #     try:
+     #         model.load_state_dict(state_dict, strict=True)
+     #     except:
+diff --git a/thirdparty/Metric3D/mono/model/backbones/ViT_DINO_reg.py b/thirdparty/Metric3D/mono/model/backbones/ViT_DINO_reg.py
+index 3fc9fd6..ba66c36 100644
+--- a/thirdparty/Metric3D/mono/model/backbones/ViT_DINO_reg.py
++++ b/thirdparty/Metric3D/mono/model/backbones/ViT_DINO_reg.py
+@@ -1108,7 +1108,7 @@ def load_ckpt_dino(checkpoint, model):
+     if checkpoint is not None:
+         try:
+             with open(checkpoint, "rb") as f:
+-                state_dict = torch.load(f)
++                state_dict = torch.load(f, weights_only=False)
+         except:
+             print('NO pretrained imagenet ckpt available! Check your path!')
+             del model.mask_token
+@@ -1177,7 +1177,7 @@ def vit_large(patch_size=14, num_register_tokens=0, checkpoint=None, **kwargs):
+ 
+     if checkpoint is not None:
+         with open(checkpoint, "rb") as f:
+-            state_dict = torch.load(f)
++            state_dict = torch.load(f, weights_only=False)
+         try:
+             model.load_state_dict(state_dict, strict=True)
+         except:
+diff --git a/thirdparty/Metric3D/training/mono/model/backbones/ViT_DINO.py b/thirdparty/Metric3D/training/mono/model/backbones/ViT_DINO.py
+index 6ba2d39..e8d4e63 100644
+--- a/thirdparty/Metric3D/training/mono/model/backbones/ViT_DINO.py
++++ b/thirdparty/Metric3D/training/mono/model/backbones/ViT_DINO.py
+@@ -1375,7 +1375,7 @@ def vit_large(patch_size=14, checkpoint=None, **kwargs):
+ 
+     if checkpoint is not None:
+         with open(checkpoint, "rb") as f:
+-            state_dict = torch.load(f)
++            state_dict = torch.load(f, weights_only=False)
+         try:
+             model.load_state_dict(state_dict, strict=True)
+         except:
+@@ -1406,7 +1406,7 @@ def vit_large(patch_size=14, checkpoint=None, **kwargs):
+     
+     # if checkpoint is not None:
+     #     with open(checkpoint, "rb") as f:
+-    #         state_dict = torch.load(f)
++    #         state_dict = torch.load(f, weights_only=False)
+     #     try:
+     #         model.load_state_dict(state_dict, strict=True)
+     #     except:
+diff --git a/thirdparty/Metric3D/training/mono/model/backbones/ViT_DINO_reg.py b/thirdparty/Metric3D/training/mono/model/backbones/ViT_DINO_reg.py
+index 3c27624..2528eec 100644
+--- a/thirdparty/Metric3D/training/mono/model/backbones/ViT_DINO_reg.py
++++ b/thirdparty/Metric3D/training/mono/model/backbones/ViT_DINO_reg.py
+@@ -896,7 +896,7 @@ def init_weights_vit_timm(module: nn.Module, name: str = ""):
+ def load_ckpt_dino(checkpoint, model, reserve_norm=True):
+     if checkpoint is not None:
+         with open(checkpoint, "rb") as f:
+-            state_dict = torch.load(f)
++            state_dict = torch.load(f, weights_only=False)
+         try:
+             model.load_state_dict(state_dict, strict=True)
+         except:
+@@ -962,7 +962,7 @@ def vit_large(patch_size=14, num_register_tokens=0, checkpoint=None, **kwargs):
+ 
+     if checkpoint is not None:
+         with open(checkpoint, "rb") as f:
+-            state_dict = torch.load(f)
++            state_dict = torch.load(f, weights_only=False)
+         try:
+             model.load_state_dict(state_dict, strict=True)
+         except:
+-- 
+2.43.0
+

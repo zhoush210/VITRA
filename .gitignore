@@ -193,3 +193,5 @@ benchmark*/
 
 .DS_Store
 
+data/*
+*.mp4
