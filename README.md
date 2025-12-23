@@ -36,6 +36,11 @@ pip install lightning-utilities torchmetrics==1.4.0
 # install droid-slam 需要很久
 cd thirdparty/HaWoR/thirdparty/DROID-SLAM
 python setup.py install
+
+# 安装机器人逆运动学求解需要的包
+conda install -c conda-forge pinocchio
+pip install casadi meshcat
+pip install logging_mp
 ```
 
 ## download
@@ -63,4 +68,32 @@ python scripts/inference_human_prediction.py \
 ```bash
 cd thirdparty/HaWoR
 python demo.py --video_path ./example/video_0.mp4 --vis_mode world --no_display
+```
+
+## mamo转化为xhand
+```bash
+python scripts/human_video_to_mano.py
+```
+
+## 可视化xhand
+```bash
+# 简化可视化（推荐先试这个）
+python scripts/visualize_xhand_action.py --simple_vis
+
+# 使用 G1 机器人模型可视化（需要 G1 模块）
+python scripts/visualize_xhand_action.py --transform_to_robot --use_finger_mapping
+
+# G1 机器人模型可视化并录制视频
+python scripts/visualize_xhand_action.py \
+  --transform_to_robot \
+  --use_finger_mapping \
+  --save_video \
+  --output_video examples/robot_motion.mp4 \
+  --fps 10
+
+# 指定特定帧范围
+python scripts/visualize_xhand_action.py --simple_vis --start_frame 0 --end_frame 50
+
+# 调整播放速度
+python scripts/visualize_xhand_action.py --fps 15
 ```
