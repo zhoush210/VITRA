@@ -41,6 +41,19 @@ python setup.py install
 conda install -c conda-forge pinocchio
 pip install casadi meshcat
 pip install logging_mp
+
+# 真机replay需要
+# 先按照unitree_sdk2_python/README.md#L30 编译安装cyclonedds
+cd ~
+git clone https://github.com/eclipse-cyclonedds/cyclonedds -b releases/0.10.x 
+cd cyclonedds && mkdir build install && cd build
+cmake .. -DCMAKE_INSTALL_PREFIX=../install
+cmake --build . --target install
+export CYCLONEDDS_HOME="/home/shihuiz/cyclonedds/install"
+cd ~/VITRA
+pip install -e unitree_sdk2_python
+pip install -r avp_teleoperate_il/requirements.txt
+pip uninstall typing -y
 ```
 
 ## download
@@ -97,3 +110,34 @@ python scripts/visualize_xhand_action.py --simple_vis --start_frame 0 --end_fram
 # 调整播放速度
 python scripts/visualize_xhand_action.py --fps 15
 ```
+
+## 真机replay
+```bash
+# 基本使用（使用默认的 xhand_action.npy）
+python scripts/replay_real.py --xhand_file examples/xhand_action.npy --use_finger_mapping
+
+# 指定帧范围和控制频率
+python scripts/replay_real.py \
+  --xhand_file examples/xhand_action.npy \
+  --start_frame 0 \
+  --end_frame 100 \
+  --fps 20
+
+# 调整平滑参数（0-1之间，0表示无平滑）
+python scripts/replay_real.py \
+  --xhand_file examples/xhand_action.npy \
+  --smoothing_alpha 0.5
+
+# 完整参数示例
+python scripts/replay_real.py \
+  --xhand_file examples/xhand_action.npy \
+  --start_frame 0 \
+  --end_frame 50 \
+  --fps 20 \
+  --transform_to_robot \
+  --use_finger_mapping \
+  --smoothing_alpha 0.3
+```
+
+注意：程序启动后会等待你按回车键开始执行，按 's' 键可以随时停止。
+
